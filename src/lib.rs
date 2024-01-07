@@ -529,6 +529,78 @@ impl<T, A: Alignment> AVec<T, A> {
         }
     }
 
+    /// Inserts an element at position `index` within the vector, shifting all elements after it to the right.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index > len`.
+    pub fn insert(&mut self, index: usize, element: T) {
+        // Copied somewhat from the standard library
+        #[cold]
+        #[cfg_attr(not(feature = "panic_immediate_abort"), inline(never))]
+        #[track_caller]
+        fn assert_failed(index: usize, len: usize) -> ! {
+            panic!("insertion index (is {index}) should be <= len (is {len})");
+        }
+
+        let len = self.len();
+
+        // Add space for the new element
+        self.reserve(1);
+
+        unsafe {
+            let p = self.as_mut_ptr().add(index);
+            if index < len {
+                // Shift everything over to make space. (Duplicating the
+                // `index`th element into two consecutive places.)
+                std::ptr::copy(p, p.add(1), len - index);
+            } else if index == len {
+                // No elements need shifting.
+            } else {
+                assert_failed(index, len);
+            }
+            std::ptr::write(p, element);
+
+            self.len += 1;
+        }
+    }
+
+    /// Removes and returns the element at position `index` within the vector,
+    /// shifting all elements after it to the left.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of bounds.
+    pub fn remove(&mut self, index: usize) -> T {
+        // Copied somewhat from the standard library
+        #[cold]
+        #[cfg_attr(not(feature = "panic_immediate_abort"), inline(never))]
+        #[track_caller]
+        fn assert_failed(index: usize, len: usize) -> ! {
+            panic!("removal index (is {index}) should be < len (is {len})");
+        }
+
+        let len = self.len();
+        if index >= len {
+            assert_failed(index, len);
+        }
+
+        unsafe {
+            // The place we are taking from.
+            let ptr = self.as_mut_ptr().add(index);
+            // Copy it out, unsafely having a copy of the value on
+            // the stack and in the vector at the same time.
+            let ret = std::ptr::read(ptr);
+
+            // Shift everything down to fill in that spot.
+            std::ptr::copy(ptr.add(1), ptr, len - index - 1);
+
+            self.len -= 1;
+
+            ret
+        }
+    }
+
     /// Collects an iterator into an [`AVec<T>`] with the provided alignment.
     #[inline]
     pub fn from_iter<I: IntoIterator<Item = T>>(align: usize, iter: I) -> Self {
@@ -603,6 +675,58 @@ impl<T, A: Alignment> AVec<T, A> {
         unsafe { core::ptr::copy_nonoverlapping(src, dst, len) };
         v.len = len;
         v
+    }
+}
+
+impl<T: Clone, A: Alignment> AVec<T, A> {
+    /// Resizes the `Vec` in-place so that `len` is equal to `new_len`.
+    ///
+    /// If `new_len` is greater than `len`, the `Vec` is extended by the
+    /// difference, with each additional slot filled with `value`.
+    /// If `new_len` is less than `len`, the `Vec` is simply truncated.
+    pub fn resize(&mut self, new_len: usize, value: T) {
+        // Copied somewhat from the standard library
+        let len = self.len();
+
+        if new_len > len {
+            self.extend_with(new_len - len, value)
+        } else {
+            self.truncate(new_len);
+        }
+    }
+
+    /// Extend the vector by `n` clones of value.
+    fn extend_with(&mut self, n: usize, value: T) {
+        // Copied somewhat from the standard library
+        self.reserve(n);
+
+        unsafe {
+            let mut ptr = self.as_mut_ptr().add(self.len());
+
+            // Write all elements except the last one
+            for _ in 1..n {
+                std::ptr::write(ptr, value.clone());
+                ptr = ptr.add(1);
+                // Increment the length in every step in case clone() panics
+                self.len += 1;
+            }
+
+            if n > 0 {
+                // We can write the last element directly without cloning needlessly
+                std::ptr::write(ptr, value);
+                self.len += 1;
+            }
+        }
+    }
+
+    /// Clones and appends all elements in a slice to the `Vec`.
+    pub fn extend_from_slice(&mut self, other: &[T]) {
+        // Copied somewhat from the standard library
+        let count = other.len();
+        self.reserve(count);
+        let len = self.len();
+        unsafe { std::ptr::copy_nonoverlapping(other.as_ptr(), self.as_mut_ptr().add(len), count) };
+        self.len += count;
     }
 }
 
@@ -866,6 +990,31 @@ mod tests {
     }
 
     #[test]
+    fn insert() {
+        let mut v = AVec::<i32>::new(16);
+        v.insert(0, 1);
+        v.insert(1, 3);
+        v.insert(1, 2);
+        v.insert(0, 0);
+        assert_eq!(&*v, &[0, 1, 2, 3]);
+
+        let mut v = AVec::<_>::from_iter(64, 0..4);
+        v.insert(0, -1);
+        v.insert(5, 5);
+        v.insert(5, 4);
+        v.insert(1, 0);
+        v.insert(2, 0);
+        assert_eq!(&*v, &[-1, 0, 0, 0, 1, 2, 3, 4, 5]);
+
+        let mut v = AVec::<_>::from_iter(64, repeat(()).take(4));
+        v.insert(3, ());
+        v.insert(0, ());
+        v.insert(2, ());
+        v.insert(7, ());
+        assert_eq!(&*v, &[(), (), (), (), (), (), (), ()]);
+    }
+
+    #[test]
     fn pop() {
         let mut v = AVec::<i32>::new(16);
         v.push(0);
@@ -892,6 +1041,33 @@ mod tests {
         assert_eq!(v.pop(), Some(()));
         assert_eq!(v.pop(), None);
         assert_eq!(v.pop(), None);
+        assert_eq!(&*v, &[]);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn remove() {
+        let mut v = AVec::<i32>::new(16);
+        v.push(0);
+        v.push(1);
+        v.push(2);
+        v.push(3);
+        assert_eq!(v.remove(2), 2);
+        assert_eq!(v.remove(2), 3);
+        assert_eq!(v.remove(0), 0);
+        assert_eq!(v.remove(0), 1);
+        assert_eq!(&*v, &[]);
+        assert!(v.is_empty());
+
+        let mut v = AVec::<()>::new(16);
+        v.push(());
+        v.push(());
+        v.push(());
+        v.push(());
+        assert_eq!(v.remove(0), ());
+        assert_eq!(v.remove(0), ());
+        assert_eq!(v.remove(0), ());
+        assert_eq!(v.remove(0), ());
         assert_eq!(&*v, &[]);
         assert!(v.is_empty());
     }
@@ -946,6 +1122,48 @@ mod tests {
         v.clear();
         assert_eq!(v.len(), 0);
         assert_eq!(&*v, &[]);
+    }
+
+    #[test]
+    fn extend_from_slice() {
+        let mut v = AVec::<i32>::new(16);
+        v.extend_from_slice(&[0, 1, 2, 3]);
+        v.extend_from_slice(&[4, 5, 6, 7, 8]);
+        assert_eq!(&*v, &[0, 1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let mut v = AVec::<()>::new(16);
+        v.extend_from_slice(&[(), (), (), ()]);
+        v.extend_from_slice(&[(), (), ()]);
+        assert_eq!(&*v, &[(), (), (), (), (), (), ()]);
+    }
+
+    #[test]
+    fn resize() {
+        let mut v = AVec::<i32>::new(16);
+        v.push(0);
+        v.push(1);
+        v.push(2);
+
+        v.resize(1, 10);
+        assert_eq!(v.len(), 1);
+        assert_eq!(&*v, &[0]);
+
+        v.resize(3, 20);
+        assert_eq!(v.len(), 3);
+        assert_eq!(&*v, &[0, 20, 20]);
+
+        let mut v = AVec::<()>::new(16);
+        v.push(());
+        v.push(());
+        v.push(());
+
+        v.resize(2, ());
+        assert_eq!(v.len(), 2);
+        assert_eq!(&*v, &[(), ()]);
+
+        v.resize(3, ());
+        assert_eq!(v.len(), 3);
+        assert_eq!(&*v, &[(), (), ()]);
     }
 
     #[test]
